@@ -213,9 +213,18 @@ class KGramMLPSeqModel(nn.Module):
         self.num_inner_layers = num_inner_layers
         self.chunk_size = chunk_size
 
-        # fill in
+        input_size = k * vocab_size
+        layers = []
+        current_size = input_size
 
-        self.net = None
+        for _ in range(num_inner_layers):
+            layers.append(nn.Linear(current_size, embed_size))
+            layers.append(nn.SiLU())
+            current_size = embed_size
+
+        layers.append(nn.Linear(current_size, vocab_size))
+
+        self.net = nn.Sequential(*layers)
 
     def forward(self, tokens_seq):
         """
@@ -306,12 +315,112 @@ class RMSNorm(nn.Module):
         norm = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         return self.weight * (x / norm)
 
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d_model, n_heads, block_size, attn_dropout = 0.1, resid_dropout = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_size = d_model // n_heads
+        self.scale = self.head_size ** -0.5
+
+        self.qkv_proj = nn.Linear(d_model, 3*d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.attn_dropout = nn.Dropout(attn_dropout)
+        self.resid_dropout = nn.Dropout(resid_dropout)
+
+        mask = torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size)
+        self.register_buffer("causal_mask", mask)
+
+    def forward(self, x):
+        B, T, C = x.shape
+
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(self.d_model, dim =2)
+
+        q = q.reshape(B, T, self.n_heads, self.head_size).transpose(1, 2)
+        k = k.reshape(B, T, self.n_heads, self.head_size).transpose(1, 2)
+        v = v.reshape(B, T, self.n_heads, self.head_size).transpose(1, 2)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        att = attn.masked_fill(self.causal_mask[:,:,:T,:T] == 0, float('-inf'))
+        att = torch.softmax(att, dim = -1)
+
+        att = self.attn_dropout(att)
+
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().reshape(B, T, C)
+        y = self.out_proj(y)
+        y = self.resid_dropout(y)
+
+        return y
+                
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, n_heads, block_size, attn_dropout = 0.1, resid_dropout = 0.1, mlp_ratio = 4.0):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_heads, block_size, attn_dropout, resid_dropout)
+        
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, int(d_model * mlp_ratio)),
+            nn.GELU(),
+            nn.Linear(int(d_model * mlp_ratio), d_model),
+            nn.Dropout(resid_dropout),
+            )
+            
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+
+        x = x + self.mlp(self.ln2(x))
+        return x
+        
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4):
+    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, block_size = 1024, attn_dropout = 0.1, resid_dropout = 0.1):
         super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.block_size = block_size
 
-        pass
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_embedding = nn.Embedding(block_size, d_model)
+        
+        self.emb_dropout = nn.Dropout(resid_dropout)
+        
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, block_size, attn_dropout, resid_dropout, mlp_ratio= 0.4)
+            for _ in range(n_blocks)
+        ])
+        
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+        
+    def forward(self, tokens_seq):
+
+        tokens_seq = tokens_seq.transpose(0, 1)
+        B, T = tokens_seq.shape
+        
+        assert T <= self.block_size, f"Sequence length {T} exceeds block_size {self.block_size}"
+        tok_emb = self.token_embedding(tokens_seq)
+        positions = torch.arange(0, T, dtype=torch.long, device=tokens_seq.device)
+        pos_emb = self.pos_embedding(positions).unsqueeze(0)
+        
+        x = tok_emb + pos_emb
+        x = self.emb_dropout(x)
+        
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.ln_f(x)
+        logits = self.head(x)
+        return logits.transpose(0, 1)
+        
+
+        
+
 
 
 ################################################################################
@@ -676,12 +785,22 @@ def main():
         vocab_size=vocab_size, embed_size=embed_size, hidden_size=embed_size
     ).to(device)
 
-    transformer = TransformerModel().to(device)
+    transformer = TransformerModel(
+    vocab_size=vocab_size,
+    d_model=512,
+    n_heads=8,
+    n_blocks=6,
+    block_size=block_size,  # matches the --block_size argument
+    attn_dropout=0.1,
+    resid_dropout=0.1,
+    ).to(device)
+
+    #transformer = TransformerModel().to(device)
 
     models = {
-        # "kgram_mlp_seq": kgram_model,
-        "lstm_seq": lstm_model,
-        # "kvcache_transformer": kv_transformer,
+        #"kgram_mlp_seq": kgram_model,
+        #"lstm_seq": lstm_model,
+        "transformer_seq": transformer,
     }
 
     ############################################################################
@@ -710,7 +829,7 @@ def main():
                 model,
                 enc,
                 args.prompt,
-                max_new_tokens=20,
+                max_new_tokens=50,
                 device=device,
                 top_p=None,
             )
@@ -719,7 +838,7 @@ def main():
                 model,
                 enc,
                 args.prompt,
-                max_new_tokens=20,
+                max_new_tokens=50,
                 device=device,
                 top_p=0.95,
             )
@@ -728,7 +847,7 @@ def main():
                 model,
                 enc,
                 args.prompt,
-                max_new_tokens=20,
+                max_new_tokens=50,
                 device=device,
                 top_p=1.0,
             )
