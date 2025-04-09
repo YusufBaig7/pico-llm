@@ -476,31 +476,21 @@ def nucleus_sampling(logits, p=0.95):
     """
     # Convert logits to probabilities using softmax
     probs = F.softmax(logits, dim=-1)
-    
-    # Sort probabilities in descending order
+
     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-    
-    # Calculate cumulative probabilities
     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-    
-    # Find indices where cumulative probability < p
     nucleus_mask = cumulative_probs <= p
-    
-    # If all values are False (very rare), take just the argmax
+
     if not nucleus_mask.any():
         return torch.argmax(logits).item()
     
-    # Get tokens and probabilities in the nucleus
     nucleus_probs = sorted_probs[nucleus_mask]
     nucleus_indices = sorted_indices[nucleus_mask]
-    
-    # Renormalize the probabilities within the nucleus
+
     nucleus_probs = nucleus_probs / nucleus_probs.sum()
-    
-    # Sample from the truncated distribution
+
     sample_idx = torch.multinomial(nucleus_probs, num_samples=1).item()
     
-    # Get the actual token ID
     return nucleus_indices[sample_idx].item()
 
 def generate_text(
