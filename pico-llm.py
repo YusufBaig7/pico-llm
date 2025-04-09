@@ -314,6 +314,26 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         norm = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         return self.weight * (x / norm)
+    
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_seq_len):
+        super(RotaryPositionalEmbedding, self).__init__()
+
+        self.rotation_matrix = torch.zeros(d_model, d_model, device=torch.device("cuda"))
+        for i in range(d_model):
+            for j in range(d_model):
+                self.rotation_matrix[i, j] = math.cos(i * j * 0.01)
+
+        self.positional_embedding = torch.zeros(max_seq_len, d_model, device=torch.device("cuda"))
+        for i in range(max_seq_len):
+            for j in range(d_model):
+                self.positional_embedding[i, j] = math.cos(i * j * 0.01)
+
+    def forward(self, x):
+
+        x += self.positional_embedding[:x.size(1), :]
+        x = torch.matmul(x, self.rotation_matrix)
+        return x
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model, n_heads, block_size, attn_dropout = 0.1, resid_dropout = 0.1):
@@ -379,14 +399,18 @@ class TransformerBlock(nn.Module):
         
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, block_size = 1024, attn_dropout = 0.1, resid_dropout = 0.1):
+    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, block_size = 1024, attn_dropout = 0.1, resid_dropout = 0.1, use_rope = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.block_size = block_size
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_embedding = nn.Embedding(block_size, d_model)
+
+        if not use_rope:
+            self.pos_embedding = nn.Embedding(block_size, d_model)
+        else:
+            self.pos_embedding = RotaryPositionalEmbedding(d_model, block_size)
         
         self.emb_dropout = nn.Dropout(resid_dropout)
         
@@ -405,10 +429,12 @@ class TransformerModel(nn.Module):
         
         assert T <= self.block_size, f"Sequence length {T} exceeds block_size {self.block_size}"
         tok_emb = self.token_embedding(tokens_seq)
-        positions = torch.arange(0, T, dtype=torch.long, device=tokens_seq.device)
-        pos_emb = self.pos_embedding(positions).unsqueeze(0)
         
-        x = tok_emb + pos_emb
+        x = self.pos_embedding(tok_emb)
+      #  positions = torch.arange(0, T, dtype=torch.long, device=tokens_seq.device)
+        #x = self.pos_embedding(tok_emb).unsqueeze(0)
+        
+      #  x = tok_emb + pos_emb
         x = self.emb_dropout(x)
         
         for block in self.blocks:
@@ -793,6 +819,7 @@ def main():
     block_size=block_size,  # matches the --block_size argument
     attn_dropout=0.1,
     resid_dropout=0.1,
+    use_rope= True,
     ).to(device)
 
     #transformer = TransformerModel().to(device)
