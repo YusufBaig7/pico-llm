@@ -230,44 +230,41 @@ class KGramMLPSeqModel(nn.Module):
         """
         tokens_seq: (seq_len, batch)
         return: (seq_len, batch, vocab_size)
-        We'll do a loop over time steps. chunk_size can reduce overhead.
         """
         seq_len, batch_size = tokens_seq.shape
-        outputs = []
+        k = self.k  # context window size
 
-        start = 0
-        while start < seq_len:
-            end = min(start + self.chunk_size, seq_len)
-            block_outputs = []
-            for t in range(start, end):
-                batch_logits = []
-                for b in range(batch_size):
-                    if t < self.k:
-                        needed = self.k - t
-                        context_ids = [0] * needed + tokens_seq[:t, b].tolist()
-                    else:
-                        context_ids = tokens_seq[t - self.k : t, b].tolist()
+        # Step 1: Pre-pad tokens_seq with zeros for the initial context (shape: (k, batch))
+        zeros = torch.zeros(
+            (k, batch_size), dtype=tokens_seq.dtype, device=tokens_seq.device
+        )
+        padded = torch.cat([zeros, tokens_seq], dim=0)  # (seq_len + k, batch)
 
-                    context_oh = F.one_hot(
-                        torch.tensor(
-                            context_ids, dtype=torch.long, device=tokens_seq.device
-                        ),
-                        num_classes=self.vocab_size,
-                    )
-                    context_flat = context_oh.flatten().float().unsqueeze(0)
-                    logits_b = self.net(context_flat)  # (1, vocab_size)
-                    batch_logits.append(logits_b)
-                block_outputs.append(
-                    torch.cat(batch_logits, dim=0).unsqueeze(0)
-                )  # (1, batch, vocab_size)
+        # Step 2: Create a sliding window view for each batch element.
+        # Transpose so that batch is the first dimension: (batch, seq_len + k)
+        padded = padded.transpose(0, 1)
+        # Use unfold to extract sliding windows of size k along the time dimension.
+        # This gives shape: (batch, seq_len + 1, k) because:
+        #  (seq_len + k) - k + 1 = seq_len + 1.
+        contexts = padded.unfold(dimension=1, size=k, step=1)
+        # We only need seq_len windows, so slice to drop the extra one.
+        contexts = contexts[:, :seq_len, :]  # (batch, seq_len, k)
+        # Rearrange to (seq_len, batch, k)
+        contexts = contexts.transpose(0, 1)
 
-            block_outputs = torch.cat(
-                block_outputs, dim=0
-            )  # (chunk_size, batch, vocab_size)
-            outputs.append(block_outputs)
-            start = end
+        # Step 3: Vectorized one-hot encoding and flattening the context window.
+        # One-hot encode: shape becomes (seq_len, batch, k, vocab_size)
+        contexts_oh = F.one_hot(contexts, num_classes=self.vocab_size).float()
+        # Flatten last two dimensions -> (seq_len, batch, k * vocab_size)
+        contexts_flat = contexts_oh.view(seq_len, batch_size, -1)
 
-        outputs = torch.cat(outputs, dim=0)  # (seq_len, batch, vocab_size)
+        # Step 4: Process all contexts in one network call.
+        # Reshape to process all contexts at once (shape: (seq_len * batch, k * vocab_size))
+        contexts_flat = contexts_flat.view(seq_len * batch_size, -1)
+        logits = self.net(contexts_flat)  # (seq_len * batch, vocab_size)
+
+        # Reshape the output back to the expected dimensions: (seq_len, batch, vocab_size)
+        outputs = logits.view(seq_len, batch_size, self.vocab_size)
         return outputs
 
 
@@ -315,23 +312,49 @@ class RMSNorm(nn.Module):
         norm = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         return self.weight * (x / norm)
     
+# class RotaryPositionalEmbedding(nn.Module):
+#     def __init__(self, d_model, max_seq_len):
+#         super(RotaryPositionalEmbedding, self).__init__()
+
+#         self.rotation_matrix = torch.zeros(d_model, d_model, device=torch.device("cuda"))
+#         for i in range(d_model):
+#             for j in range(d_model):
+#                 self.rotation_matrix[i, j] = math.cos(i * j * 0.01)
+
+#         self.positional_embedding = torch.zeros(max_seq_len, d_model, device=torch.device("cuda"))
+#         for i in range(max_seq_len):
+#             for j in range(d_model):
+#                 self.positional_embedding[i, j] = math.cos(i * j * 0.01)
+
+
+
+    # def forward(self, x):
+
+    #     x += self.positional_embedding[:x.size(1), :]
+    #     x = torch.matmul(x, self.rotation_matrix)
+    #     return x
+
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_seq_len):
         super(RotaryPositionalEmbedding, self).__init__()
 
-        self.rotation_matrix = torch.zeros(d_model, d_model, device=torch.device("cuda"))
+        # Initialize on CPU and then move to the appropriate device later
+        self.rotation_matrix = torch.zeros(d_model, d_model)
         for i in range(d_model):
             for j in range(d_model):
                 self.rotation_matrix[i, j] = math.cos(i * j * 0.01)
 
-        self.positional_embedding = torch.zeros(max_seq_len, d_model, device=torch.device("cuda"))
+        self.positional_embedding = torch.zeros(max_seq_len, d_model)
         for i in range(max_seq_len):
             for j in range(d_model):
                 self.positional_embedding[i, j] = math.cos(i * j * 0.01)
 
     def forward(self, x):
-
-        x += self.positional_embedding[:x.size(1), :]
+        # Move to the same device as input
+        self.rotation_matrix = self.rotation_matrix.to(x.device)
+        self.positional_embedding = self.positional_embedding.to(x.device)
+        
+        x = x + self.positional_embedding[:x.size(1), :]
         x = torch.matmul(x, self.rotation_matrix)
         return x
 
@@ -516,11 +539,20 @@ def generate_text(
     with torch.no_grad():
         context_tokens = enc.encode(init_text)
         annotation_list = []
+        
+        # Get the block size limit from the model
+        block_size = model.block_size if hasattr(model, 'block_size') else 1024
 
         for step_i in range(max_new_tokens):
+            # Ensure context doesn't exceed block_size
+            if len(context_tokens) >= block_size:
+                # If context would be too long, truncate it (keeping the most recent tokens)
+                context_tokens = context_tokens[-(block_size-1):]
+                
             seq_tensor = torch.tensor(
                 context_tokens, dtype=torch.long, device=device
             ).unsqueeze(1)
+            
             logits_seq = model(seq_tensor)  # (seq_len,1,vocab_size)
             next_logits = logits_seq[-1, 0, :]  # shape (vocab_size,)
 
@@ -556,16 +588,14 @@ def generate_text(
 
     annotated_text = "".join(annotated_strs)
     return final_text, annotated_text
-
-
 ################################################################################
 # 8. Training
 ################################################################################
 
-
 def train_one_model(
     model,
     loader,
+    test_loader,  # New parameter
     epochs,
     model_name,
     device,
@@ -585,6 +615,10 @@ def train_one_model(
     start_time = time.time()
     next_sample_time = start_time
     global_step = 0
+
+    train_losses = []
+    test_losses = []
+    steps = []
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -612,10 +646,33 @@ def train_one_model(
 
             if batch_idx % log_steps == 0:
                 avg_part_loss = partial_loss / partial_count
+
+                model.eval()
+                with torch.no_grad():
+                    test_loss = 0.0
+                    test_count = 0
+                    for test_batch in test_loader:
+                        test_batch = test_batch.to(device)
+                        test_logits = model(test_batch)
+                        test_batch_loss = compute_next_token_loss(test_logits, test_batch)
+                        test_loss += test_batch_loss.item()
+                        test_count += 1
+                        if test_count >= 5:  # Limit test evaluation for speed
+                            break
+                    
+                    avg_test_loss = test_loss / test_count if test_count > 0 else 0
+                model.train()
+                
+                # Save for plotting
+                train_losses.append(avg_part_loss)
+                test_losses.append(avg_test_loss)
+                steps.append(global_step)
+
                 print(
                     f"[{model_name}] Epoch {epoch}/{epochs}, "
                     f"Step {batch_idx}/{len(loader)} (global step: {global_step}) "
-                    f"Partial Avg Loss: {avg_part_loss:.4f}"
+                    f"Train Loss: {avg_part_loss:.4f}, Test Loss: {avg_test_loss:.4f}, "
+                    f"Gap: {avg_test_loss - avg_part_loss:.4f}"
                 )
                 partial_loss = 0.0
                 partial_count = 0
@@ -682,209 +739,247 @@ def train_one_model(
 
         avg_loss = total_loss / step_in_epoch
         print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
+    
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 6))
+        plt.plot(steps, train_losses, 'b-', label='Train Loss')
+        plt.plot(steps, test_losses, 'r-', label='Test Loss')
+        plt.title(f"{model_name} Training vs Testing Loss")
+        plt.xlabel("Steps")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"{model_name}_overfitting.png")
+        print(f"Saved overfitting analysis plot to {model_name}_overfitting.png")
+    except Exception as e:
+        print(f"Could not create plot: {e}")
+    
+    return train_losses, test_losses, steps
+
+def split_dataset(dataset, split_ratio=0.8):
+    """Split a dataset into training and testing parts."""
+    dataset_size = len(dataset)
+    indices = list(range(dataset_size))
+    split = int(dataset_size * split_ratio)
+    
+    # Custom dataset classes
+    class SubsetDataset(torch.utils.data.Dataset):
+        def __init__(self, original_dataset, indices):
+            self.dataset = original_dataset
+            self.indices = indices
+            
+        def __len__(self):
+            return len(self.indices)
+            
+        def __getitem__(self, idx):
+            return self.dataset[self.indices[idx]]
+    
+    # Shuffle indices
+    import random
+    random.shuffle(indices)
+    
+    # Create subsets
+    train_indices = indices[:split]
+    test_indices = indices[split:]
+    
+    train_set = SubsetDataset(dataset, train_indices)
+    test_set = SubsetDataset(dataset, test_indices)
+    
+    return train_set, test_set
 
 
 ################################################################################
 # 9. Main
 ################################################################################
 
-
 def main():
     args = parse_args()
+    device = torch.device(args.device_id if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # Additional local variables from arguments
-    k = args.kgram_k
-    chunk_size = args.kgram_chunk_size
-
-    embed_size = args.embed_size
-    batch_size = 16
-    num_epochs = 3
-    learning_rate = 1e-3
-
+    # Hyperparams
+    embed_size = args.embed_size  
     block_size = args.block_size
-    train_subset_size = 20000
-    log_interval_steps = 100
-    sample_interval_seconds = 30
+    batch_size = 8
+    num_epochs = 3  # Changed to 3 epochs as requested
+    learning_rate = 1e-3
+    log_steps = 50
+    train_subset_size = 2000  # Using a small subset for faster training
+    prompt = args.prompt
 
-    max_steps_per_epoch = args.max_steps_per_epoch
-    num_inner_layers = args.num_inner_mlp_layers
-
-    # NEW: pick device from args.device_id, fallback to cpu if needed
-    requested_device_id = args.device_id
-    if requested_device_id.startswith("cuda") and not torch.cuda.is_available():
-        print(
-            f"Requested device '{requested_device_id}' but CUDA not available. Falling back to CPU."
-        )
-        device = torch.device("cpu")
-    else:
-        device = torch.device(requested_device_id)
-
-    print(
-        f"Using device: {device}, block_size={block_size}, kgram_k={k}, chunk_size={chunk_size}, embed_size={embed_size}"
-    )
-
-    ############################################################################
-    # Data
-    ############################################################################
-    tinystories_seqs = []
-    other_seqs = []
-
-    if args.tinystories_weight > 0.0:
-        print(
-            f"Loading TinyStories from huggingface with weight={args.tinystories_weight}..."
-        )
-        dataset = load_dataset("roneneldan/TinyStories", split="train")
-        dataset = dataset.select(range(train_subset_size))
-    else:
-        print("TinyStories weight=0 => skipping TinyStories.")
-        dataset = None
-
+    # Load tokenizer
     enc = tiktoken.get_encoding("gpt2")
     vocab_size = enc.n_vocab
-    print(f"Vocab size: {vocab_size}")
+    print(f"Vocabulary size: {vocab_size}")
 
-    if dataset is not None:
-        for sample in dataset:
-            text = sample["text"]
-            tokens = enc.encode(text)
-            tokens = tokens[:block_size]
-            if len(tokens) > 0:
-                tinystories_seqs.append(tokens)
-        print(f"TinyStories sequences: {len(tinystories_seqs)}")
+    print("Loading TinyStories...")
+    dataset = load_dataset("roneneldan/TinyStories", split="train")
+    dataset = dataset.select(range(train_subset_size))
+    tinystories_seqs = [
+        enc.encode(sample["text"])[:block_size]
+        for sample in dataset
+        if len(enc.encode(sample["text"])) > 0
+    ]
+    print(f"Loaded {len(tinystories_seqs)} sequences from TinyStories")
 
-    if args.input_files:
-        for filepath in args.input_files:
-            print(f"Reading custom text file: {filepath}")
-            with open(filepath, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                tokens = enc.encode(line)
-                tokens = tokens[:block_size]
-                if len(tokens) > 0:
-                    other_seqs.append(tokens)
-        print(f"Custom input files: {len(other_seqs)} sequences loaded.")
-    else:
-        print("No custom input files provided.")
-
-    p_tiny = args.tinystories_weight
-    if len(tinystories_seqs) == 0 and p_tiny > 0:
-        print(
-            "Warning: TinyStories is empty but tinystories_weight>0. That's okay, no data from it."
-        )
-    combined_dataset = MixedSequenceDataset(
-        tinystories_seqs=tinystories_seqs, other_seqs=other_seqs, p_tiny=p_tiny
-    )
+    # Create dataset with train/test split
+    full_dataset = MixedSequenceDataset(tinystories_seqs, [], p_tiny=1.0)
+    train_dataset, test_dataset = split_dataset(full_dataset, split_ratio=0.8)
+    
+    print(f"Training set size: {len(train_dataset)}, Test set size: {len(test_dataset)}")
 
     train_loader = torch.utils.data.DataLoader(
-        combined_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=seq_collate_fn,
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        collate_fn=seq_collate_fn
+    )
+    
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        collate_fn=seq_collate_fn
     )
 
-    ############################################################################
-    # Models
-    ############################################################################
-    kgram_model = KGramMLPSeqModel(
-        vocab_size=vocab_size,
-        k=k,
-        embed_size=embed_size,
-        num_inner_layers=num_inner_layers,
-        chunk_size=chunk_size,
-    ).to(device)
-
-    lstm_model = LSTMSeqModel(
-        vocab_size=vocab_size, embed_size=embed_size, hidden_size=embed_size
-    ).to(device)
-
-    transformer = TransformerModel(
-    vocab_size=vocab_size,
-    d_model=512,
-    n_heads=8,
-    n_blocks=6,
-    block_size=block_size,  # matches the --block_size argument
-    attn_dropout=0.1,
-    resid_dropout=0.1,
-    use_rope= True,
-    ).to(device)
-
-    #transformer = TransformerModel().to(device)
-
+    # Define models with specified parameters
     models = {
-        #"kgram_mlp_seq": kgram_model,
-        #"lstm_seq": lstm_model,
-        "transformer_seq": transformer,
+        # KGramMLPSeqModel with k=3
+        "kmlp_seq": KGramMLPSeqModel(
+            vocab_size=vocab_size, 
+            k=3,  # Explicitly set k=3
+            embed_size=embed_size, 
+            num_inner_layers=args.num_inner_mlp_layers,
+            chunk_size=args.kgram_chunk_size
+        ).to(device),
+        
+        # TransformerModel with the specified parameters
+        "transformer_seq": TransformerModel(
+            vocab_size=vocab_size, 
+            d_model=embed_size, 
+            n_heads=8, 
+            n_blocks=6,
+            block_size=block_size, 
+            use_rope=True
+        ).to(device),
     }
 
-    ############################################################################
-    # Train each model
-    ############################################################################
-    for model_name, model in models.items():
-        print(f"\n=== Training model: {model_name} ===")
-        train_one_model(
+    # Train and evaluate each model
+    for name, model in models.items():
+        print(f"\n=== Training: {name} ===")
+        # Count parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Model has {total_params:,} parameters")
+        
+        # Train the model
+        train_losses, test_losses, steps = train_one_model(
             model=model,
             loader=train_loader,
+            test_loader=test_loader,
             epochs=num_epochs,
-            model_name=model_name,
+            model_name=name,
             device=device,
             lr=learning_rate,
-            log_steps=log_interval_steps,
-            sample_interval=sample_interval_seconds,
-            max_steps_per_epoch=max_steps_per_epoch,
+            log_steps=log_steps,
+            sample_interval=30,  # Generate samples every 30 seconds
+            max_steps_per_epoch=args.max_steps_per_epoch,
             enc=enc,
-            prompt=args.prompt,  # <--- Pass the user-specified prompt here
+            monosemantic_info=None,  # No monosemantic analysis
+            prompt=prompt
         )
 
-        # Final generation from the user-provided prompt (args.prompt).
-        with torch.no_grad():
-            # 1) Greedy
-            text_greedy, ann_greedy = generate_text(
-                model,
-                enc,
-                args.prompt,
-                max_new_tokens=50,
-                device=device,
-                top_p=None,
-            )
-            # 2) top-p=0.95
-            text_topp, ann_topp = generate_text(
-                model,
-                enc,
-                args.prompt,
-                max_new_tokens=50,
-                device=device,
-                top_p=0.95,
-            )
-            # 3) top-p=1.0 => full distribution random sampling
-            text_topp1, ann_topp1 = generate_text(
-                model,
-                enc,
-                args.prompt,
-                max_new_tokens=50,
-                device=device,
-                top_p=1.0,
-            )
+        print(f"\n=== Generating final samples for {name} ===")
+        try:
+            import matplotlib.pyplot as plt
 
-        print(f"[{model_name}] Final sample (greedy) from prompt: '{args.prompt}'")
-        print(text_greedy)
-        print(f"Annotated:\n{ann_greedy}\n")
+            # Sample with different top-p values
+            methods = ["Greedy", "Top-p=0.7", "Top-p=0.9", "Top-p=1.0"]
+            top_p_vals = [None, 0.7, 0.9, 1.0]
+            diversity = []
 
-        print(f"[{model_name}] Final sample (top-p=0.95) from prompt: '{args.prompt}'")
-        print(text_topp)
-        print(f"Annotated:\n{ann_topp}\n")
+            for p in top_p_vals:
+                samples = []
+                all_tokens = []
+                for _ in range(5):  # Generate 5 samples for each method
+                    text, _ = generate_text(
+                        model, enc, prompt, max_new_tokens=30, device=device, top_p=p
+                    )
+                    new_text = text[len(prompt):]
+                    tokens = enc.encode(new_text)
+                    samples.append(new_text)
+                    all_tokens.extend(tokens)
+                    
+                # Calculate token diversity
+                unique_ratio = len(set(all_tokens)) / len(all_tokens) if all_tokens else 0
+                diversity.append(unique_ratio)
+                
+                print(f"[{name} | top_p={p}] Sample: {samples[0][:50]}... | Diversity: {unique_ratio:.3f}")
 
-        print(f"[{model_name}] Final sample (top-p=1.0) from prompt: '{args.prompt}'")
-        print(text_topp1)
-        print(f"Annotated:\n{ann_topp1}")
-        print("--------------------------------------------------")
+            # Save diversity plot with improved formatting
+            plt.figure(figsize=(10, 6))
+            bars = plt.bar(methods, diversity, color=["#2C3E50", "#E74C3C", "#3498DB", "#27AE60"])
+            plt.title(f"Token Diversity Analysis - {name} Model", fontsize=16, fontweight='bold')
+            plt.ylabel("Unique Token Ratio (Higher = More Diverse)", fontsize=12)
+            plt.xlabel("Sampling Method", fontsize=12)
+            plt.ylim(0, 1)
+            plt.grid(axis='y', alpha=0.3, linestyle='--')
+            
+            # Add value labels on top of bars
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height + 0.02,
+                        f'{height:.3f}', ha='center', va='bottom', fontsize=10)
+            
+            # Add explanation text
+            plt.figtext(0.5, 0.01, 
+                      "Higher diversity indicates more varied token selection during text generation",
+                      ha="center", fontsize=10, style='italic')
+            
+            # Improve tick labels
+            plt.tick_params(axis='both', which='major', labelsize=10)
+            
+            # Save with high DPI for better quality
+            plt.tight_layout(rect=[0, 0.03, 1, 0.97])  # Adjust for the explanation text
+            plt.savefig(f"{name}_token_diversity.png", dpi=300)
+            print(f"Saved diversity analysis to {name}_token_diversity.png")
+            plt.close()
 
-    # Finally, let's share how I'm feeling:
-    print("\n*** I'm feeling great today! Hope you're well, too. ***")
+            # Plot training and test losses with improved labels
+            plt.figure(figsize=(10, 6))
+            plt.plot(steps, train_losses, 'b-', linewidth=2, label='Training Loss')
+            plt.plot(steps, test_losses, 'r-', linewidth=2, label='Validation Loss')
+            plt.title(f"{name} Model: Training vs Validation Loss", fontsize=14)
+            plt.xlabel("Training Steps", fontsize=12)
+            plt.ylabel("Cross Entropy Loss", fontsize=12)
+            plt.legend(fontsize=12)
+            plt.grid(True, alpha=0.3)
+            
+            # Add min/max annotations
+            min_train_idx = train_losses.index(min(train_losses))
+            min_test_idx = test_losses.index(min(test_losses))
+            
+            plt.annotate(f'Min: {min(train_losses):.4f}', 
+                         xy=(steps[min_train_idx], min(train_losses)),
+                         xytext=(10, -20), textcoords='offset points',
+                         arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=.2"))
+                         
+            plt.annotate(f'Min: {min(test_losses):.4f}', 
+                         xy=(steps[min_test_idx], min(test_losses)),
+                         xytext=(10, 20), textcoords='offset points',
+                         arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=.2"))
+            
+            # Improve tick labels
+            plt.tick_params(axis='both', which='major', labelsize=10)
+            
+            # Save with high DPI for better quality
+            plt.tight_layout()
+            plt.savefig(f"{name}_loss_curve.png", dpi=300)
+            print(f"Saved loss curve to {name}_loss_curve.png")
+            plt.close()
 
+        except Exception as e:
+            print(f"Plotting failed for {name}: {e}")
 
 if __name__ == "__main__":
     main()
