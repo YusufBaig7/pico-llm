@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 # We do not import numpy or scikit-learn, so we implement a naive k-means in pure PyTorch.
 # If you prefer scikit-learn, you can adapt the code.
@@ -52,7 +53,7 @@ def parse_args():
         action="store_true",
         help="(DISABLED BY DEFAULT) If set, run the monosemantic analysis.",
     )
-    parser.set_defaults(monosemantic_enabled=False)  # disable by default
+    parser.set_defaults(monosemantic_enabled=True)  # disable by default
 
     # Additional hyperparams to mitigate slow k-gram
     parser.add_argument(
@@ -227,47 +228,35 @@ class KGramMLPSeqModel(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, tokens_seq):
-        """
-        tokens_seq: (seq_len, batch)
-        return: (seq_len, batch, vocab_size)
-        We'll do a loop over time steps. chunk_size can reduce overhead.
-        """
         seq_len, batch_size = tokens_seq.shape
-        outputs = []
-
-        start = 0
-        while start < seq_len:
-            end = min(start + self.chunk_size, seq_len)
-            block_outputs = []
-            for t in range(start, end):
-                batch_logits = []
-                for b in range(batch_size):
-                    if t < self.k:
-                        needed = self.k - t
-                        context_ids = [0] * needed + tokens_seq[:t, b].tolist()
-                    else:
-                        context_ids = tokens_seq[t - self.k : t, b].tolist()
-
-                    context_oh = F.one_hot(
-                        torch.tensor(
-                            context_ids, dtype=torch.long, device=tokens_seq.device
-                        ),
-                        num_classes=self.vocab_size,
-                    )
-                    context_flat = context_oh.flatten().float().unsqueeze(0)
-                    logits_b = self.net(context_flat)  # (1, vocab_size)
-                    batch_logits.append(logits_b)
-                block_outputs.append(
-                    torch.cat(batch_logits, dim=0).unsqueeze(0)
-                )  # (1, batch, vocab_size)
-
-            block_outputs = torch.cat(
-                block_outputs, dim=0
-            )  # (chunk_size, batch, vocab_size)
-            outputs.append(block_outputs)
-            start = end
-
-        outputs = torch.cat(outputs, dim=0)  # (seq_len, batch, vocab_size)
+        k = self.k  # context window size
+        # Step 1: Pre-pad tokens_seq with zeros for the initial context (shape: (k, batch))
+        zeros = torch.zeros(
+                    (k, batch_size), dtype=tokens_seq.dtype, device=tokens_seq.device
+                )
+        padded = torch.cat([zeros, tokens_seq], dim=0)  # (seq_len + k, batch)
+        # Step 2: Create a sliding window view for each batch element.
+        # Transpose so that batch is the first dimension: (batch, seq_len + k)
+        padded = padded.transpose(0, 1)
+        # Use unfold to extract sliding windows of size k along the time dimension.
+        # This gives shape: (batch, seq_len + 1, k) because:
+        #  (seq_len + k) - k + 1 = seq_len + 1.
+        contexts = padded.unfold(dimension=1, size=k, step=1)
+        # We only need seq_len windows, so slice to drop the extra one.
+        contexts = contexts[:, :seq_len, :]  # (batch, seq_len, k)
+        # Rearrange to (seq_len, batch, k)
+        contexts = contexts.transpose(0, 1)
+        # Step 3: Vectorized one-hot encoding and flattening the context window.
+        # One-hot encode: shape becomes (seq_len, batch, k, vocab_size)
+        contexts_oh = F.one_hot(contexts, num_classes=self.vocab_size).float()
+        # Flatten last two dimensions -> (seq_len, batch, k * vocab_size)
+        contexts_flat = contexts_oh.view(seq_len, batch_size, -1)
+        # Step 4: Process all contexts in one network call.
+        # Reshape to process all contexts at once (shape: (seq_len * batch, k * vocab_size))
+        contexts_flat = contexts_flat.view(seq_len * batch_size, -1)
+        logits = self.net(contexts_flat)  # (seq_len * batch, vocab_size)
+        # Reshape the output back to the expected dimensions: (seq_len, batch, vocab_size)
+        outputs = logits.view(seq_len, batch_size, self.vocab_size)
         return outputs
 
 
@@ -304,6 +293,15 @@ class LSTMSeqModel(nn.Module):
 #    Very slow Python loop for training. Multi-head sums head outputs.
 ################################################################################
 
+activations = {}
+
+def save_activation(name):
+    def hook(module, input, output):
+        print("Hello00000000000000")
+        # Save the output activation (detach to avoid tracking gradients)
+        activations[name] = output.detach().cpu()
+    return hook
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
@@ -334,6 +332,23 @@ class RotaryPositionalEmbedding(nn.Module):
         x += self.positional_embedding[:x.size(1), :]
         x = torch.matmul(x, self.rotation_matrix)
         return x
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len):
+
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0) 
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        seq_len = x.size(1)
+        pos_encoding = self.pe[:, :seq_len]
+        return x + pos_encoding
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model, n_heads, block_size, attn_dropout = 0.1, resid_dropout = 0.1):
@@ -399,7 +414,7 @@ class TransformerBlock(nn.Module):
         
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, block_size = 1024, attn_dropout = 0.1, resid_dropout = 0.1, use_rope = False):
+    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4, block_size = 1024, attn_dropout = 0.1, resid_dropout = 0.1, use_rope = False, use_nope = False, use_sinu = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -407,10 +422,14 @@ class TransformerModel(nn.Module):
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
 
-        if not use_rope:
-            self.pos_embedding = nn.Embedding(block_size, d_model)
-        else:
+        if use_nope:
+            self.pos_embedding = None
+        elif use_rope:
             self.pos_embedding = RotaryPositionalEmbedding(d_model, block_size)
+        elif use_sinu:
+            self.pos_embedding = SinusoidalPositionalEmbedding(d_model, block_size)
+        else:
+            self.pos_embedding = nn.Embedding(block_size, d_model)
         
         self.emb_dropout = nn.Dropout(resid_dropout)
         
@@ -428,13 +447,22 @@ class TransformerModel(nn.Module):
         B, T = tokens_seq.shape
         
         assert T <= self.block_size, f"Sequence length {T} exceeds block_size {self.block_size}"
+        #tok_emb = self.token_embedding(tokens_seq) * math.sqrt(self.d_model)    sinusoidal
+        # tok_emb = self.token_embedding(tokens_seq) 
+        
+        # x = self.pos_embedding(tok_emb) # Absolute Embeddings
+        # positions = torch.arange(0, T, dtype=torch.long, device=tokens_seq.device)  # Absolute Embeddings
+        # pos_emb = self.pos_embedding(positions).unsqueeze(0)  # Absolute Embeddings
+        # x = tok_emb + pos_emb  # Absolute Embeddings
+
+        # if self.pos_embedding is not None:
+        #     tok_emb = self.pos_embedding(tok_emb)
+
         tok_emb = self.token_embedding(tokens_seq)
+        positions = torch.arange(0, T, dtype=torch.long, device=tokens_seq.device)
+        pos_emb = self.pos_embedding(positions).unsqueeze(0)
         
-        x = self.pos_embedding(tok_emb)
-      #  positions = torch.arange(0, T, dtype=torch.long, device=tokens_seq.device)
-        #x = self.pos_embedding(tok_emb).unsqueeze(0)
-        
-      #  x = tok_emb + pos_emb
+        x = tok_emb + pos_emb
         x = self.emb_dropout(x)
         
         for block in self.blocks:
@@ -443,6 +471,9 @@ class TransformerModel(nn.Module):
         x = self.ln_f(x)
         logits = self.head(x)
         return logits.transpose(0, 1)
+    
+
+
         
 
         
@@ -455,7 +486,61 @@ class TransformerModel(nn.Module):
 
 
 def monosemantic_analysis_for_token(token_id, model, enc, device="cpu", top_n=5):
-    return []
+    """
+    Perform a simple analysis to rank neurons by their consistency (low variance)
+    for a given token. This function assumes that a forward pass has been run such
+    that the global 'activations' dict contains an entry for 'last_mlp'.
+    
+    Args:
+        token_id (int): The token ID for which to perform analysis.
+        model (nn.Module): The transformer model.
+        enc: The tokenizer/encoding object.
+        device (str): Device used for analysis.
+        top_n (int): Number of top neurons to return.
+        
+    Returns:
+        List of tuples (neuron_index, variance) for the top_n neurons with lowest variance.
+    """
+    # Ensure the model runs in evaluation mode.
+    model.eval()
+
+    # Prepare a prompt that includes the token of interest.
+    # For demonstration, we assume that 'token_id' appears at the last position.
+    # You might wish to craft inputs more carefully in practice.
+    token_str = enc.decode([token_id])
+    prompt = f"This is a sentence that ends with the token: {token_str}"
+    context_tokens = torch.tensor(enc.encode(prompt), dtype=torch.long, device=device).unsqueeze(1)
+    
+    # Run the model forward (activations will be captured by the hook).
+    with torch.no_grad():
+        _ = model(context_tokens)
+
+    print("Activations:", activations)
+    
+    # Retrieve the activations from the last MLP layer.
+    # Expected shape: (batch, seq_len, hidden_size)
+    if "last_mlp" not in activations:
+        print("No activations recorded. Ensure the hook is registered correctly.")
+        return []
+    
+    act = activations["last_mlp"]
+    
+    # For analysis, we focus on the token position where our token of interest appears.
+    # Here we assume it is the last token in the sequence.
+    token_activation = act[:, -1, :]  # shape: (batch, hidden_size)
+    
+    # Compute the variance for each neuron (across batch samples).
+    # Lower variance implies more consistent (monosemantic) behavior.
+    variances = token_activation.var(dim=0)  # shape: (hidden_size,)
+    
+    # Identify the top_n neurons with the smallest variance.
+    # (We use negative variance for topk to pick the smallest values.)
+    top_vars, top_indices = torch.topk(-variances, top_n)
+    
+    # Prepare and return the results as a list of tuples (neuron_index, variance).
+    results = [(idx.item(), variances[idx].item()) for idx in top_indices]
+    return results
+
 
 
 ################################################################################
@@ -501,7 +586,7 @@ def generate_text(
     device="cpu",
     top_p=None,
     monosemantic_info=None,
-    do_monosemantic=False,
+    do_monosemantic=True,
 ):
     """
     A single code path for all models:
@@ -549,6 +634,7 @@ def generate_text(
         token_str = enc.decode([tid])
         if neighs:
             neighbor_strs = [f"{enc.decode([x[1]])}" for x in neighs]
+            print("------------------------------------Neighbour Stats")
             annotated = f"{token_str}[NN={neighbor_strs}]"
         else:
             annotated = token_str
@@ -585,6 +671,9 @@ def train_one_model(
     start_time = time.time()
     next_sample_time = start_time
     global_step = 0
+    loss_history = []            # All training losses (per batch)
+    log_global_steps = []        # Global steps for which logging occurs
+    log_partial_losses = [] 
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -606,6 +695,7 @@ def train_one_model(
             loss.backward()
             optimizer.step()
 
+            loss_history.append(loss.item())
             total_loss += loss.item()
             partial_loss += loss.item()
             partial_count += 1
@@ -617,6 +707,8 @@ def train_one_model(
                     f"Step {batch_idx}/{len(loader)} (global step: {global_step}) "
                     f"Partial Avg Loss: {avg_part_loss:.4f}"
                 )
+                log_global_steps.append(global_step)
+                log_partial_losses.append(avg_part_loss)
                 partial_loss = 0.0
                 partial_count = 0
 
@@ -684,6 +776,17 @@ def train_one_model(
         print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
 
 
+    plt.figure(figsize=(10, 6))
+    plt.plot(log_global_steps, log_partial_losses, marker='o', linestyle='-', label='Partial Avg Loss')
+    plt.xlabel('Global Step')
+    plt.ylabel('Partial Average Loss')
+    plt.title('Partial Avg Loss vs Global Steps')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+
 ################################################################################
 # 9. Main
 ################################################################################
@@ -711,7 +814,7 @@ def main():
 
     # NEW: pick device from args.device_id, fallback to cpu if needed
     requested_device_id = args.device_id
-    if requested_device_id.startswith("cuda") and not torch.cuda.is_available():
+    if requested_device_id.startswith("mps") and not torch.backends.mps.is_available():
         print(
             f"Requested device '{requested_device_id}' but CUDA not available. Falling back to CPU."
         )
@@ -809,7 +912,9 @@ def main():
     block_size=block_size,  # matches the --block_size argument
     attn_dropout=0.1,
     resid_dropout=0.1,
-    use_rope= True,
+    use_rope= False,
+    use_nope= False,
+    use_sinu= False,
     ).to(device)
 
     #transformer = TransformerModel().to(device)
@@ -883,6 +988,14 @@ def main():
         print("--------------------------------------------------")
 
     # Finally, let's share how I'm feeling:
+
+
+    if args.monosemantic_enabled:
+        transformer.blocks[-1].mlp.register_forward_hook(save_activation("last_mlp"))
+        monosemantic_info = activations
+        print("Activations:", activations)
+        print(monosemantic_info)
+    
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
 
 
