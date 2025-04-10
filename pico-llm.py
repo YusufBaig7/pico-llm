@@ -228,35 +228,47 @@ class KGramMLPSeqModel(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, tokens_seq):
+        """
+        tokens_seq: (seq_len, batch)
+        return: (seq_len, batch, vocab_size)
+        We'll do a loop over time steps. chunk_size can reduce overhead.
+        """
         seq_len, batch_size = tokens_seq.shape
-        k = self.k  # context window size
-        # Step 1: Pre-pad tokens_seq with zeros for the initial context (shape: (k, batch))
-        zeros = torch.zeros(
-                    (k, batch_size), dtype=tokens_seq.dtype, device=tokens_seq.device
-                )
-        padded = torch.cat([zeros, tokens_seq], dim=0)  # (seq_len + k, batch)
-        # Step 2: Create a sliding window view for each batch element.
-        # Transpose so that batch is the first dimension: (batch, seq_len + k)
-        padded = padded.transpose(0, 1)
-        # Use unfold to extract sliding windows of size k along the time dimension.
-        # This gives shape: (batch, seq_len + 1, k) because:
-        #  (seq_len + k) - k + 1 = seq_len + 1.
-        contexts = padded.unfold(dimension=1, size=k, step=1)
-        # We only need seq_len windows, so slice to drop the extra one.
-        contexts = contexts[:, :seq_len, :]  # (batch, seq_len, k)
-        # Rearrange to (seq_len, batch, k)
-        contexts = contexts.transpose(0, 1)
-        # Step 3: Vectorized one-hot encoding and flattening the context window.
-        # One-hot encode: shape becomes (seq_len, batch, k, vocab_size)
-        contexts_oh = F.one_hot(contexts, num_classes=self.vocab_size).float()
-        # Flatten last two dimensions -> (seq_len, batch, k * vocab_size)
-        contexts_flat = contexts_oh.view(seq_len, batch_size, -1)
-        # Step 4: Process all contexts in one network call.
-        # Reshape to process all contexts at once (shape: (seq_len * batch, k * vocab_size))
-        contexts_flat = contexts_flat.view(seq_len * batch_size, -1)
-        logits = self.net(contexts_flat)  # (seq_len * batch, vocab_size)
-        # Reshape the output back to the expected dimensions: (seq_len, batch, vocab_size)
-        outputs = logits.view(seq_len, batch_size, self.vocab_size)
+        outputs = []
+
+        start = 0
+        while start < seq_len:
+            end = min(start + self.chunk_size, seq_len)
+            block_outputs = []
+            for t in range(start, end):
+                batch_logits = []
+                for b in range(batch_size):
+                    if t < self.k:
+                        needed = self.k - t
+                        context_ids = [0] * needed + tokens_seq[:t, b].tolist()
+                    else:
+                        context_ids = tokens_seq[t - self.k : t, b].tolist()
+
+                    context_oh = F.one_hot(
+                        torch.tensor(
+                            context_ids, dtype=torch.long, device=tokens_seq.device
+                        ),
+                        num_classes=self.vocab_size,
+                    )
+                    context_flat = context_oh.flatten().float().unsqueeze(0)
+                    logits_b = self.net(context_flat)  # (1, vocab_size)
+                    batch_logits.append(logits_b)
+                block_outputs.append(
+                    torch.cat(batch_logits, dim=0).unsqueeze(0)
+                )  # (1, batch, vocab_size)
+
+            block_outputs = torch.cat(
+                block_outputs, dim=0
+            )  # (chunk_size, batch, vocab_size)
+            outputs.append(block_outputs)
+            start = end
+
+        outputs = torch.cat(outputs, dim=0)  # (seq_len, batch, vocab_size)
         return outputs
 
 
@@ -313,23 +325,49 @@ class RMSNorm(nn.Module):
         norm = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         return self.weight * (x / norm)
     
+# class RotaryPositionalEmbedding(nn.Module):
+#     def __init__(self, d_model, max_seq_len):
+#         super(RotaryPositionalEmbedding, self).__init__()
+
+#         self.rotation_matrix = torch.zeros(d_model, d_model, device=torch.device("cuda"))
+#         for i in range(d_model):
+#             for j in range(d_model):
+#                 self.rotation_matrix[i, j] = math.cos(i * j * 0.01)
+
+#         self.positional_embedding = torch.zeros(max_seq_len, d_model, device=torch.device("cuda"))
+#         for i in range(max_seq_len):
+#             for j in range(d_model):
+#                 self.positional_embedding[i, j] = math.cos(i * j * 0.01)
+
+
+
+    # def forward(self, x):
+
+    #     x += self.positional_embedding[:x.size(1), :]
+    #     x = torch.matmul(x, self.rotation_matrix)
+    #     return x
+
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_seq_len):
         super(RotaryPositionalEmbedding, self).__init__()
 
-        self.rotation_matrix = torch.zeros(d_model, d_model, device=torch.device("cuda"))
+        # Initialize on CPU and then move to the appropriate device later
+        self.rotation_matrix = torch.zeros(d_model, d_model)
         for i in range(d_model):
             for j in range(d_model):
                 self.rotation_matrix[i, j] = math.cos(i * j * 0.01)
 
-        self.positional_embedding = torch.zeros(max_seq_len, d_model, device=torch.device("cuda"))
+        self.positional_embedding = torch.zeros(max_seq_len, d_model)
         for i in range(max_seq_len):
             for j in range(d_model):
                 self.positional_embedding[i, j] = math.cos(i * j * 0.01)
 
     def forward(self, x):
-
-        x += self.positional_embedding[:x.size(1), :]
+        # Move to the same device as input
+        self.rotation_matrix = self.rotation_matrix.to(x.device)
+        self.positional_embedding = self.positional_embedding.to(x.device)
+        
+        x = x + self.positional_embedding[:x.size(1), :]
         x = torch.matmul(x, self.rotation_matrix)
         return x
 
@@ -601,11 +639,20 @@ def generate_text(
     with torch.no_grad():
         context_tokens = enc.encode(init_text)
         annotation_list = []
+        
+        # Get the block size limit from the model
+        block_size = model.block_size if hasattr(model, 'block_size') else 1024
 
         for step_i in range(max_new_tokens):
+            # Ensure context doesn't exceed block_size
+            if len(context_tokens) >= block_size:
+                # If context would be too long, truncate it (keeping the most recent tokens)
+                context_tokens = context_tokens[-(block_size-1):]
+                
             seq_tensor = torch.tensor(
                 context_tokens, dtype=torch.long, device=device
             ).unsqueeze(1)
+            
             logits_seq = model(seq_tensor)  # (seq_len,1,vocab_size)
             next_logits = logits_seq[-1, 0, :]  # shape (vocab_size,)
 
@@ -642,16 +689,14 @@ def generate_text(
 
     annotated_text = "".join(annotated_strs)
     return final_text, annotated_text
-
-
 ################################################################################
 # 8. Training
 ################################################################################
 
-
 def train_one_model(
     model,
     loader,
+    test_loader,  # New parameter
     epochs,
     model_name,
     device,
@@ -671,9 +716,6 @@ def train_one_model(
     start_time = time.time()
     next_sample_time = start_time
     global_step = 0
-    loss_history = []            # All training losses (per batch)
-    log_global_steps = []        # Global steps for which logging occurs
-    log_partial_losses = [] 
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -702,10 +744,33 @@ def train_one_model(
 
             if batch_idx % log_steps == 0:
                 avg_part_loss = partial_loss / partial_count
+
+                model.eval()
+                with torch.no_grad():
+                    test_loss = 0.0
+                    test_count = 0
+                    for test_batch in test_loader:
+                        test_batch = test_batch.to(device)
+                        test_logits = model(test_batch)
+                        test_batch_loss = compute_next_token_loss(test_logits, test_batch)
+                        test_loss += test_batch_loss.item()
+                        test_count += 1
+                        if test_count >= 5:  # Limit test evaluation for speed
+                            break
+                    
+                    avg_test_loss = test_loss / test_count if test_count > 0 else 0
+                model.train()
+                
+                # Save for plotting
+                train_losses.append(avg_part_loss)
+                test_losses.append(avg_test_loss)
+                steps.append(global_step)
+
                 print(
                     f"[{model_name}] Epoch {epoch}/{epochs}, "
                     f"Step {batch_idx}/{len(loader)} (global step: {global_step}) "
-                    f"Partial Avg Loss: {avg_part_loss:.4f}"
+                    f"Train Loss: {avg_part_loss:.4f}, Test Loss: {avg_test_loss:.4f}, "
+                    f"Gap: {avg_test_loss - avg_part_loss:.4f}"
                 )
                 log_global_steps.append(global_step)
                 log_partial_losses.append(avg_part_loss)
@@ -776,17 +841,6 @@ def train_one_model(
         print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
 
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(log_global_steps, log_partial_losses, marker='o', linestyle='-', label='Partial Avg Loss')
-    plt.xlabel('Global Step')
-    plt.ylabel('Partial Average Loss')
-    plt.title('Partial Avg Loss vs Global Steps')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-
-
 ################################################################################
 # 9. Main
 ################################################################################
@@ -814,7 +868,7 @@ def main():
 
     # NEW: pick device from args.device_id, fallback to cpu if needed
     requested_device_id = args.device_id
-    if requested_device_id.startswith("mps") and not torch.backends.mps.is_available():
+    if requested_device_id.startswith("cuda") and not torch.cuda.is_available():
         print(
             f"Requested device '{requested_device_id}' but CUDA not available. Falling back to CPU."
         )
@@ -844,49 +898,36 @@ def main():
 
     enc = tiktoken.get_encoding("gpt2")
     vocab_size = enc.n_vocab
-    print(f"Vocab size: {vocab_size}")
+    print(f"Vocabulary size: {vocab_size}")
 
-    if dataset is not None:
-        for sample in dataset:
-            text = sample["text"]
-            tokens = enc.encode(text)
-            tokens = tokens[:block_size]
-            if len(tokens) > 0:
-                tinystories_seqs.append(tokens)
-        print(f"TinyStories sequences: {len(tinystories_seqs)}")
+    print("Loading TinyStories...")
+    dataset = load_dataset("roneneldan/TinyStories", split="train")
+    dataset = dataset.select(range(train_subset_size))
+    tinystories_seqs = [
+        enc.encode(sample["text"])[:block_size]
+        for sample in dataset
+        if len(enc.encode(sample["text"])) > 0
+    ]
+    print(f"Loaded {len(tinystories_seqs)} sequences from TinyStories")
 
-    if args.input_files:
-        for filepath in args.input_files:
-            print(f"Reading custom text file: {filepath}")
-            with open(filepath, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                tokens = enc.encode(line)
-                tokens = tokens[:block_size]
-                if len(tokens) > 0:
-                    other_seqs.append(tokens)
-        print(f"Custom input files: {len(other_seqs)} sequences loaded.")
-    else:
-        print("No custom input files provided.")
-
-    p_tiny = args.tinystories_weight
-    if len(tinystories_seqs) == 0 and p_tiny > 0:
-        print(
-            "Warning: TinyStories is empty but tinystories_weight>0. That's okay, no data from it."
-        )
-    combined_dataset = MixedSequenceDataset(
-        tinystories_seqs=tinystories_seqs, other_seqs=other_seqs, p_tiny=p_tiny
-    )
+    # Create dataset with train/test split
+    full_dataset = MixedSequenceDataset(tinystories_seqs, [], p_tiny=1.0)
+    train_dataset, test_dataset = split_dataset(full_dataset, split_ratio=0.8)
+    
+    print(f"Training set size: {len(train_dataset)}, Test set size: {len(test_dataset)}")
 
     train_loader = torch.utils.data.DataLoader(
-        combined_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=seq_collate_fn,
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        collate_fn=seq_collate_fn
+    )
+    
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        collate_fn=seq_collate_fn
     )
 
     ############################################################################
@@ -912,9 +953,7 @@ def main():
     block_size=block_size,  # matches the --block_size argument
     attn_dropout=0.1,
     resid_dropout=0.1,
-    use_rope= False,
-    use_nope= False,
-    use_sinu= False,
+    use_rope= True,
     ).to(device)
 
     #transformer = TransformerModel().to(device)
@@ -933,13 +972,14 @@ def main():
         train_one_model(
             model=model,
             loader=train_loader,
+            test_loader=test_loader,
             epochs=num_epochs,
-            model_name=model_name,
+            model_name=name,
             device=device,
             lr=learning_rate,
-            log_steps=log_interval_steps,
-            sample_interval=sample_interval_seconds,
-            max_steps_per_epoch=max_steps_per_epoch,
+            log_steps=log_steps,
+            sample_interval=30,  # Generate samples every 30 seconds
+            max_steps_per_epoch=args.max_steps_per_epoch,
             enc=enc,
             prompt=args.prompt,  # <--- Pass the user-specified prompt here
         )
@@ -988,14 +1028,6 @@ def main():
         print("--------------------------------------------------")
 
     # Finally, let's share how I'm feeling:
-
-
-    if args.monosemantic_enabled:
-        transformer.blocks[-1].mlp.register_forward_hook(save_activation("last_mlp"))
-        monosemantic_info = activations
-        print("Activations:", activations)
-        print(monosemantic_info)
-    
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
 
 
